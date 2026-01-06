@@ -1,0 +1,8 @@
+{
+  "name": "ExamSaathi - Your AI Study Companion",
+  "description": "An empathetic and intelligent AI study companion that generates structured notes, conducts interactive revisions, provides motivation, and offers personalized learning support.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
