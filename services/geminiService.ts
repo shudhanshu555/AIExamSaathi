@@ -1,4 +1,3 @@
-
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { SYSTEM_INSTRUCTION } from "../constants";
 
@@ -14,7 +13,13 @@ export const generateNotes = async (topic: string, course: string, year: string,
   University: ${university}
   Target Length: ${length}
 
-  Include key concepts, formulas (with LaTeX notation), diagram descriptions, study tips, and practice points.
+  STRICT NOTATION RULES:
+  1. Use LaTeX for ALL mathematical, chemical, and scientific notations.
+  2. For the 'formula' field, provide the raw LaTeX string WITHOUT delimiters (e.g., "\\frac{-b \\pm \\sqrt{b^2-4ac}}{2a}").
+  3. For 'keyConcepts', 'tips', and 'practicePoints', wrap inline math/notations in single dollar signs (e.g., "$E=mc^2$").
+  4. Ensure chemical formulas are written in LaTeX (e.g., "$H_2SO_4$").
+  5. For each formula, provide a 'realWorldExample' that makes the abstract idea tangible and relatable for a student.
+
   Respond strictly in JSON format.`;
 
   const response = await ai.models.generateContent({
@@ -34,9 +39,10 @@ export const generateNotes = async (topic: string, course: string, year: string,
               properties: {
                 name: { type: Type.STRING },
                 formula: { type: Type.STRING },
-                explanation: { type: Type.STRING }
+                explanation: { type: Type.STRING },
+                realWorldExample: { type: Type.STRING, description: "A tangible real-world application or example of this formula." }
               },
-              required: ["name", "formula", "explanation"]
+              required: ["name", "formula", "explanation", "realWorldExample"]
             }
           },
           diagramDescriptions: { type: Type.ARRAY, items: { type: Type.STRING } },
@@ -51,11 +57,34 @@ export const generateNotes = async (topic: string, course: string, year: string,
   return JSON.parse(response.text);
 };
 
+export const generateDiagram = async (description: string) => {
+  const ai = getAI();
+  const prompt = `Create a simple, clear educational diagram for: ${description}. 
+  The diagram should be clean, scientific, and easy to understand.`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash-image',
+      contents: { parts: [{ text: prompt }] },
+    });
+
+    for (const part of response.candidates[0].content.parts) {
+      if (part.inlineData) {
+        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error("Image Generation Error:", error);
+    return null;
+  }
+};
+
 export const generateQuizQuestion = async (topic: string, difficulty: string, type: 'MCQ' | 'OPEN_ENDED' = 'OPEN_ENDED') => {
   const ai = getAI();
   const prompt = `Generate a unique ${type} quiz question about ${topic} with ${difficulty} difficulty. 
   ${type === 'MCQ' ? 'Provide exactly 4 distinct options. One must be correct.' : ''}
-  Include a hint, the correct answer, and a detailed explanation.`;
+  Include a hint, the correct answer, and a detailed explanation. Use LaTeX for math/science notations.`;
 
   const response = await ai.models.generateContent({
     model: 'gemini-3-flash-preview',
@@ -92,7 +121,7 @@ export const evaluateAnswer = async (question: string, correctAnswer: string, us
   User Answer: ${userAnswer}
 
   Evaluate if the answer is CORRECT, INCORRECT, or PARTIAL. Provide a score from 0 to 100.
-  Also provide feedback on what was missed.`;
+  Also provide feedback on what was missed. Use LaTeX for any technical feedback.`;
 
   const response = await ai.models.generateContent({
     model: 'gemini-3-flash-preview',

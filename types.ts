@@ -1,4 +1,3 @@
-
 export enum View {
   DASHBOARD = 'DASHBOARD',
   NOTES_GENERATOR = 'NOTES_GENERATOR',
@@ -23,7 +22,12 @@ export interface Note {
   length: 'SHORT' | 'MODERATE' | 'LONG';
   content: {
     keyConcepts: string[];
-    formulas: { name: string; formula: string; explanation: string }[];
+    formulas: { 
+      name: string; 
+      formula: string; 
+      explanation: string; 
+      realWorldExample: string;
+    }[];
     diagramDescriptions: string[];
     tips: string[];
     practicePoints: string[];

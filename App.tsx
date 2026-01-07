@@ -38,7 +38,7 @@ async function decodeAudioData(
   sampleRate: number,
   numChannels: number,
 ): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
+  const dataInt16 = new Int16Array(data.buffer, data.byteOffset, data.byteLength / 2);
   const frameCount = dataInt16.length / numChannels;
   const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
 
@@ -86,7 +86,7 @@ const App: React.FC = () => {
   const audioContexts = useRef<{ input: AudioContext; output: AudioContext; tts: AudioContext } | null>(null);
   const sources = useRef<Set<AudioBufferSourceNode>>(new Set());
   const nextStartTime = useRef<number>(0);
-  const sessionPromise = useRef<any>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const [isVoiceActive, setIsVoiceActive] = useState(false);
   const [voiceTranscription, setVoiceTranscription] = useState<{ user: string; ai: string }>({ user: '', ai: '' });
@@ -117,7 +117,12 @@ const App: React.FC = () => {
     setState(prev => ({ ...prev, theme: prev.theme === Theme.LIGHT ? Theme.DARK : Theme.LIGHT }));
   };
 
-  const setView = (view: View) => setState(prev => ({ ...prev, view }));
+  const setView = (view: View) => {
+    if (view !== View.AI_ASSISTANT) {
+        stopVoiceSession();
+    }
+    setState(prev => ({ ...prev, view }));
+  }
 
   const handleSaveNote = (note: Note) => {
     setState(prev => ({ ...prev, notes: [...prev.notes, note], view: View.DASHBOARD }));
@@ -156,7 +161,7 @@ const App: React.FC = () => {
         });
         setChatHistory(prev => [...prev, { role: 'ai', text: response }]);
     } catch (err) {
-        setChatHistory(prev => [...prev, { role: 'ai', text: "I'm having a bit of trouble connecting. Let me try again later." }]);
+        setChatHistory(prev => [...prev, { role: 'ai', text: "I'm having a bit of trouble connecting." }]);
     } finally {
         setChatLoading(false);
     }
@@ -170,10 +175,8 @@ const App: React.FC = () => {
           tts: new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 })
         };
       }
-      
       const ttsCtx = audioContexts.current.tts;
       if (ttsCtx.state === 'suspended') await ttsCtx.resume();
-
       const base64Audio = await generateSpeech(text);
       if (base64Audio) {
         const audioBuffer = await decodeAudioData(decode(base64Audio), ttsCtx, 24000, 1);
@@ -185,52 +188,28 @@ const App: React.FC = () => {
       }
     } catch (err: any) {
       console.error("TTS Error:", err);
-      setChatHistory(prev => [...prev, { role: 'ai', text: "(Voice error: " + (err?.message || "Internal Service Error") + ")" }]);
     }
     return 0;
   };
 
   const handleAssistantToolCall = async (fc: any) => {
-    console.debug('Study Companion triggering tool:', fc.name, fc.args);
     let result = "ok";
-    
     switch (fc.name) {
-      case 'generate_notes':
-        setView(View.NOTES_GENERATOR);
-        result = `Navigated to notes generator. Topic identified: ${fc.args.topic}. Starting notes engine...`;
-        break;
-      case 'start_quiz':
-        setView(View.QUIZ);
-        result = `Starting a revision session for ${fc.args.topic}. Get ready!`;
-        break;
-      case 'show_history':
-        setView(View.HISTORY);
-        result = "Opening your academic history now.";
-        break;
-      case 'set_pomodoro':
-        setView(View.POMODORO);
-        result = "Switching to focus mode.";
-        break;
-      case 'get_motivation':
-        handleQuickAction('MOTIVATION');
-        result = "Providing motivation boost.";
-        break;
-      case 'solve_doubt':
-        result = `Searching for a simplified explanation for ${fc.args.concept}...`;
-        break;
-      case 'go_home':
-        setView(View.DASHBOARD);
-        result = "Returning to the main dashboard.";
-        break;
-      default:
-        result = "Feature not implemented via voice yet.";
+      case 'generate_notes': setView(View.NOTES_GENERATOR); break;
+      case 'start_quiz': setView(View.QUIZ); break;
+      case 'show_history': setView(View.HISTORY); break;
+      case 'set_pomodoro': setView(View.POMODORO); break;
+      case 'get_motivation': handleQuickAction('MOTIVATION'); break;
+      case 'go_home': setView(View.DASHBOARD); break;
+      default: result = "Unknown tool.";
     }
-
-    sessionPromise.current.then((session: any) => {
-      session.sendToolResponse({
-        functionResponses: { id: fc.id, name: fc.name, response: { result } }
-      });
-    });
+    if (sessionPromiseRef.current) {
+        sessionPromiseRef.current.then((session: any) => {
+            session.sendToolResponse({
+                functionResponses: { id: fc.id, name: fc.name, response: { result } }
+            });
+        });
+    }
   };
 
   const startVoiceSession = async () => {
@@ -243,12 +222,14 @@ const App: React.FC = () => {
           output: new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 }),
         };
       }
-      
+      if (audioContexts.current.input.state === 'suspended') await audioContexts.current.input.resume();
+      if (audioContexts.current.output.state === 'suspended') await audioContexts.current.output.resume();
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
 
-      sessionPromise.current = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+      const sessionPromise = ai.live.connect({
+        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
@@ -263,23 +244,21 @@ const App: React.FC = () => {
             const source = audioContexts.current!.input.createMediaStreamSource(stream);
             const scriptProcessor = audioContexts.current!.input.createScriptProcessor(4096, 1, 1);
             scriptProcessor.onaudioprocess = (e) => {
+              // CRITICAL: Solely rely on sessionPromise resolution
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
-              sessionPromise.current.then((session: any) => {
+              sessionPromise.then((session: any) => {
                 session.sendRealtimeInput({ media: pcmBlob });
               });
             };
             source.connect(scriptProcessor);
             scriptProcessor.connect(audioContexts.current!.input.destination);
-            (window as any)._scriptProcessor = scriptProcessor; // Keep ref to disconnect later
+            (window as any)._scriptProcessor = scriptProcessor;
           },
           onmessage: async (message: LiveServerMessage) => {
             if (message.toolCall) {
-              for (const fc of message.toolCall.functionCalls) {
-                handleAssistantToolCall(fc);
-              }
+              for (const fc of message.toolCall.functionCalls) handleAssistantToolCall(fc);
             }
-
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio) {
               const outCtx = audioContexts.current!.output;
@@ -289,56 +268,57 @@ const App: React.FC = () => {
               const source = outCtx.createBufferSource();
               source.buffer = buffer;
               source.connect(outCtx.destination);
-              source.addEventListener('ended', () => sources.current.delete(source));
               source.start(nextStartTime.current);
               nextStartTime.current += buffer.duration;
               sources.current.add(source);
+              source.onended = () => sources.current.delete(source);
             }
-
             if (message.serverContent?.inputTranscription) {
-                setVoiceTranscription(prev => ({ ...prev, user: message.serverContent?.inputTranscription?.text || '' }));
+              setVoiceTranscription(prev => ({ ...prev, user: message.serverContent?.inputTranscription?.text || '' }));
             }
             if (message.serverContent?.outputTranscription) {
-                setVoiceTranscription(prev => ({ ...prev, ai: (prev.ai + (message.serverContent?.outputTranscription?.text || '')) }));
+              setVoiceTranscription(prev => ({ ...prev, ai: (prev.ai + (message.serverContent?.outputTranscription?.text || '')) }));
             }
             if (message.serverContent?.turnComplete) {
-                setVoiceTranscription(prev => ({ user: '', ai: '' }));
+              setVoiceTranscription({ user: '', ai: '' });
             }
-
             if (message.serverContent?.interrupted) {
-              sources.current.forEach(s => s.stop());
+              sources.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sources.current.clear();
               nextStartTime.current = 0;
             }
           },
-          onerror: (e) => console.error('Live Error:', e),
+          onerror: (e) => stopVoiceSession(),
           onclose: () => setIsVoiceActive(false),
         },
       });
+      sessionPromiseRef.current = sessionPromise;
     } catch (err) {
-      console.error("Failed to start voice:", err);
+      setIsVoiceActive(false);
     }
   };
 
   const stopVoiceSession = () => {
-    if (sessionPromise.current) {
-      sessionPromise.current.then((s: any) => s.close());
+    setIsVoiceActive(false);
+    if (sessionPromiseRef.current) {
+      sessionPromiseRef.current.then((s: any) => { try { s.close(); } catch(e) {} });
+      sessionPromiseRef.current = null;
     }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
     }
     if ((window as any)._scriptProcessor) {
         (window as any)._scriptProcessor.disconnect();
         (window as any)._scriptProcessor = null;
     }
-    setIsVoiceActive(false);
+    sources.current.forEach(s => { try { s.stop(); } catch(e) {} });
+    sources.current.clear();
     setVoiceTranscription({ user: '', ai: '' });
   };
 
   useEffect(() => {
-    // Disable mini-companion voice if full assistant view is active
     const isFullAssistantActive = state.view === View.AI_ASSISTANT;
-    
     if (isAssistantOpen && assistantMode === 'VOICE' && !isFullAssistantActive) {
       startVoiceSession();
     } else {
@@ -347,18 +327,13 @@ const App: React.FC = () => {
     return () => stopVoiceSession();
   }, [isAssistantOpen, assistantMode, state.view]);
 
-  // Handle browser speech-to-text for form fields
   const startSTT = (callback: (text: string) => void) => {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SpeechRecognition) {
-          alert("Speech recognition not supported in this browser.");
-          return;
-      }
+      if (!SpeechRecognition) return;
       const recognition = new SpeechRecognition();
       recognition.lang = 'en-IN';
       recognition.onresult = (event: any) => {
-          const text = event.results[0][0].transcript;
-          callback(text);
+          callback(event.results[0][0].transcript);
       };
       recognition.start();
   };
@@ -368,19 +343,14 @@ const App: React.FC = () => {
       <nav className="sticky top-0 z-40 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-md border-b border-zinc-200 dark:border-zinc-800 px-6 py-4">
         <div className="max-w-7xl mx-auto flex justify-between items-center">
             <div className="flex items-center gap-3 cursor-pointer" onClick={() => setView(View.DASHBOARD)}>
-                <div className="bg-accent-light p-2 rounded-xl text-white shadow-lg shadow-accent-light/20">
+                <div className="bg-accent-light p-2 rounded-xl text-white shadow-lg">
                     <span className="text-xl font-bold">ES</span>
                 </div>
                 <h1 className="text-xl font-bold tracking-tight">ExamSaathi</h1>
             </div>
-            <div className="flex items-center gap-4">
-                <button onClick={toggleTheme} className="p-3 rounded-2xl bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors">
-                    {ICONS.Theme}
-                </button>
-                <button onClick={() => setView(View.HISTORY)} className="hidden md:flex items-center gap-2 bg-zinc-100 dark:bg-zinc-800 px-4 py-2 rounded-xl font-semibold text-sm">
-                    {ICONS.History} <span className="opacity-70">Analytics</span>
-                </button>
-            </div>
+            <button onClick={toggleTheme} className="p-3 rounded-2xl bg-zinc-100 dark:bg-zinc-800 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors">
+                {ICONS.Theme}
+            </button>
         </div>
       </nav>
 
@@ -394,19 +364,15 @@ const App: React.FC = () => {
         {state.view === View.AI_ASSISTANT && <AssistantView onBack={() => setView(View.DASHBOARD)} onSpeak={startSTT} onSpeakText={handleSpeakText} notesCount={state.notes.length} quizCount={state.quizHistory.length} />}
       </main>
 
-      {/* Floating Mini Companion */}
       <div className="fixed bottom-8 right-8 z-50 flex flex-col items-end gap-4">
           {isAssistantOpen && (
               <div className="w-80 md:w-96 h-[600px] bg-white dark:bg-zinc-800 rounded-[2.5rem] shadow-2xl border border-zinc-200 dark:border-zinc-700 flex flex-col overflow-hidden animate-slideInUp">
                   <header className="p-6 bg-cyan-600 text-white flex justify-between items-center">
                       <div className="flex items-center gap-2">
                         <div className={`w-3 h-3 rounded-full ${isVoiceActive ? 'bg-green-300 animate-pulse' : 'bg-white/50'}`}></div>
-                        <div>
-                            <span className="font-bold text-lg block leading-none">Study Companion</span>
-                            <span className="text-[10px] opacity-70 uppercase font-black tracking-widest">Mini Solver</span>
-                        </div>
+                        <span className="font-bold text-lg">Companion</span>
                       </div>
-                      <button onClick={() => setIsAssistantOpen(false)} className="opacity-70 hover:opacity-100 p-2">✕</button>
+                      <button onClick={() => { setIsAssistantOpen(false); stopVoiceSession(); }} className="opacity-70 hover:opacity-100 p-2">✕</button>
                   </header>
 
                   <div className="flex p-2 bg-zinc-100 dark:bg-zinc-900 mx-6 mt-4 rounded-2xl">
@@ -421,63 +387,43 @@ const App: React.FC = () => {
                   <div className="flex-1 overflow-y-auto p-6 space-y-4">
                       {assistantMode === 'VOICE' ? (
                         <div className="h-full flex flex-col items-center justify-center text-center space-y-6 animate-fadeIn">
-                            <div className="relative">
-                                <div className={`absolute inset-0 bg-cyan-500/20 rounded-full blur-3xl transition-all duration-1000 ${isVoiceActive ? 'scale-150 opacity-100' : 'scale-50 opacity-0'}`}></div>
-                                <div className={`w-24 h-24 rounded-full border-4 border-cyan-500 flex items-center justify-center relative bg-white dark:bg-zinc-800 z-10 ${isVoiceActive ? 'animate-pulse' : ''}`}>
-                                    <div className="text-cyan-500">{ICONS.Message}</div>
-                                </div>
+                            <div className={`w-24 h-24 rounded-full border-4 border-cyan-500 flex items-center justify-center relative bg-white dark:bg-zinc-800 z-10 ${isVoiceActive ? 'animate-pulse shadow-[0_0_50px_rgba(6,182,212,0.3)]' : ''}`}>
+                                <div className="text-cyan-500">{ICONS.Message}</div>
                             </div>
                             <div className="w-full space-y-3 px-2">
-                                {voiceTranscription.user && <div className="p-3 bg-zinc-50 dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-700 text-xs font-medium opacity-60">" {voiceTranscription.user} "</div>}
-                                {voiceTranscription.ai && <div className="p-4 bg-cyan-500/5 text-cyan-700 dark:text-cyan-300 rounded-2xl border border-cyan-500/10 text-sm font-bold leading-relaxed">{voiceTranscription.ai}</div>}
-                                {!voiceTranscription.user && !voiceTranscription.ai && <p className="text-xs opacity-40 font-medium italic">"Tell me what's on your mind!"</p>}
+                                {voiceTranscription.user && <div className="p-3 bg-zinc-50 dark:bg-zinc-900 rounded-2xl border text-xs italic">"{voiceTranscription.user}"</div>}
+                                {voiceTranscription.ai && <div className="p-4 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 rounded-2xl border border-cyan-500/20 text-sm font-bold leading-relaxed">{voiceTranscription.ai}</div>}
+                                {!voiceTranscription.user && !voiceTranscription.ai && <p className="text-xs opacity-40 font-medium">Listening for your questions...</p>}
                             </div>
-                            {isVoiceActive && (
-                                <div className="flex gap-1 items-end h-6">
-                                    {[1, 2, 3, 4, 5, 6, 7].map(i => <div key={i} className="w-1 bg-cyan-500 rounded-full animate-bounce" style={{ height: `${20 + Math.random() * 80}%`, animationDelay: `${i * 0.1}s` }}></div>)}
-                                </div>
-                            )}
                         </div>
                       ) : (
                         <>
-                          {chatHistory.length === 0 && (
-                              <div className="text-center py-10 opacity-50 space-y-2">
-                                  <div className="text-4xl mx-auto w-12 h-12 flex items-center justify-center bg-cyan-100 dark:bg-cyan-900/40 rounded-full text-cyan-600">🧠</div>
-                                  <p className="text-sm font-bold">Ask anything!</p>
-                              </div>
-                          )}
                           {chatHistory.map((msg, i) => (
                               <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                                  <div className={`max-w-[85%] group p-4 rounded-3xl text-sm leading-relaxed shadow-sm relative ${msg.role === 'user' ? 'bg-cyan-600 text-white rounded-tr-none' : 'bg-zinc-100 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 rounded-tl-none'}`}>
+                                  <div className={`max-w-[85%] p-4 rounded-3xl text-sm ${msg.role === 'user' ? 'bg-cyan-600 text-white rounded-tr-none' : 'bg-zinc-100 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 rounded-tl-none'}`}>
                                       {msg.text}
-                                      {msg.role === 'ai' && (
-                                          <button onClick={() => handleSpeakText(msg.text)} className="absolute -right-10 top-2 p-2 bg-white dark:bg-zinc-800 border dark:border-zinc-700 rounded-full shadow-sm opacity-0 group-hover:opacity-100 transition-all hover:bg-cyan-600 hover:text-white"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg></button>
-                                      )}
                                   </div>
                               </div>
                           ))}
-                          {chatLoading && <div className="flex justify-start"><div className="bg-zinc-100 dark:bg-zinc-700 p-3 rounded-2xl animate-pulse text-xs">Thinking...</div></div>}
+                          {chatLoading && <div className="bg-zinc-100 dark:bg-zinc-700 p-3 rounded-2xl animate-pulse text-xs">ExamSaathi is typing...</div>}
                         </>
                       )}
                   </div>
 
                   {assistantMode === 'CHAT' && (
-                    <form onSubmit={handleSendChat} className="p-6 border-t border-zinc-100 dark:border-zinc-700">
+                    <form onSubmit={handleSendChat} className="p-6 border-t dark:border-zinc-700">
                         <div className="flex gap-2 bg-zinc-100 dark:bg-zinc-900 p-2 rounded-2xl">
                           <button type="button" onClick={() => startSTT(setChatMsg)} className="p-2 text-zinc-400 hover:text-cyan-600">{ICONS.Mic}</button>
-                          <input type="text" value={chatMsg} onChange={e => setChatMsg(e.target.value)} placeholder="Type a doubt..." className="flex-1 p-3 bg-transparent outline-none text-sm" />
-                          <button className="p-3 bg-cyan-600 text-white rounded-xl shadow-lg shadow-cyan-600/20"><svg className="w-5 h-5 rotate-90" fill="currentColor" viewBox="0 0 20 20"><path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" /></svg></button>
+                          <input type="text" value={chatMsg} onChange={e => setChatMsg(e.target.value)} placeholder="Ask anything..." className="flex-1 p-3 bg-transparent outline-none text-sm" />
+                          <button className="p-3 bg-cyan-600 text-white rounded-xl shadow-lg"><svg className="w-5 h-5 rotate-90" fill="currentColor" viewBox="0 0 20 20"><path d="M10.894 2.553a1 1 0 00-1.788 0l-7 14a1 1 0 001.169 1.409l5-1.429A1 1 0 009 15.571V11a1 1 0 112 0v4.571a1 1 0 00.725.962l5 1.428a1 1 0 001.17-1.408l-7-14z" /></svg></button>
                         </div>
                     </form>
                   )}
               </div>
           )}
-          
-          <div className="flex flex-col items-center gap-2">
-            <button onClick={() => setIsAssistantOpen(!isAssistantOpen)} className={`w-20 h-20 rounded-full shadow-2xl flex items-center justify-center hover:scale-110 active:scale-95 transition-all relative overflow-hidden group ${isAssistantOpen ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-white' : 'bg-cyan-600 text-white'}`}>
-                {isAssistantOpen ? <span className="text-2xl font-black">✕</span> : ICONS.Message}
-            </button>
-          </div>
+          <button onClick={() => setIsAssistantOpen(!isAssistantOpen)} className={`w-16 h-16 rounded-full shadow-2xl flex items-center justify-center hover:scale-110 active:scale-95 transition-all ${isAssistantOpen ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800' : 'bg-cyan-600 text-white'}`}>
+              {isAssistantOpen ? '✕' : ICONS.Message}
+          </button>
       </div>
 
       {motivationMsg && (
@@ -485,7 +431,7 @@ const App: React.FC = () => {
               <div className="bg-white dark:bg-zinc-800 max-w-lg w-full rounded-[3rem] shadow-2xl p-10 space-y-8 animate-scaleIn">
                   <div className="text-5xl text-center">🏆</div>
                   <p className="text-2xl font-serif italic opacity-90 leading-relaxed text-center">{motivationMsg}</p>
-                  <button onClick={() => setMotivationMsg(null)} className="w-full py-5 bg-accent-light text-white font-black text-lg rounded-2xl shadow-xl transition-all">KEEP GOING 💪</button>
+                  <button onClick={() => setMotivationMsg(null)} className="w-full py-5 bg-accent-light text-white font-black text-lg rounded-2xl shadow-xl transition-all">CHALO PADHTE HAIN! 💪</button>
               </div>
           </div>
       )}
